@@ -1,0 +1,162 @@
+!pip install flask-ngrok
+
+!pip install flask pyspark
+
+!ngrok config add-authtoken 2wXdMPHy2KnOS6jqpAaApEGLvml_4bwVnuZVxa6sF1EZXkkXn
+
+!pip install flask flask_cors pyngrok
+!pip install findspark
+# -----------------------------
+# PySpark & ML Setup
+# -----------------------------
+import findspark
+findspark.init()
+
+from pyspark.ml.feature import PCA, StringIndexer, OneHotEncoder, VectorAssembler, MinMaxScaler
+from pyspark.ml.clustering import KMeans
+from pyspark.ml.recommendation import ALS, ALSModel
+from pyspark.ml.evaluation import RegressionEvaluator
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql import Row
+import seaborn as sns
+import matplotlib.pyplot as plt
+import pandas as pd
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+# Initialize Spark
+spark = SparkSession.builder.appName("HealthRecSystem").getOrCreate()
+spark.sparkContext.setLogLevel("ERROR")
+
+# Load CSVs
+df = spark.read.csv("sym_dia_diff.csv", header=True, inferSchema=True)
+sym = spark.read.csv("symptoms.csv", header=True, inferSchema=True)
+dia = spark.read.csv("diagnosis.csv", header=True, inferSchema=True)
+
+# Indexing and One-Hot Encoding
+string_indexer = StringIndexer(inputCol="symptom", outputCol="symptom_index").setHandleInvalid("skip").fit(df)
+df = string_indexer.transform(df)
+encoder = OneHotEncoder(dropLast=False, inputCols=["symptom_index"], outputCols=["symptom_vec"])
+df = encoder.fit(df).transform(df)
+
+string_indexer = StringIndexer(inputCol="diagnose", outputCol="diagnose_index").setHandleInvalid("skip").fit(df)
+df = string_indexer.transform(df)
+encoder = OneHotEncoder(dropLast=False, inputCols=["diagnose_index"], outputCols=["diagnose_vec"])
+df = encoder.fit(df).transform(df)
+
+# Scaling
+for col in ["symptom_vec", "diagnose_vec"]:
+    scaler = MinMaxScaler(inputCol=col, outputCol=col + "_scaled")
+    df = scaler.fit(df).transform(df)
+
+# Assemble Features
+vec_assembler = VectorAssembler(inputCols=["symptom_vec_scaled", "diagnose_vec_scaled"], outputCol="features")
+df = vec_assembler.transform(df)
+
+# PCA + KMeans
+kmeans = KMeans(k=2, seed=1)
+model = kmeans.fit(df.select("features"))
+df = model.transform(df)
+
+pca = PCA(k=2, inputCol="features", outputCol="pcaFeatures")
+pca_model = pca.fit(df)
+result = pca_model.transform(df).select("pcaFeatures")
+
+# Plotting PCA
+pandasDf = result.toPandas()
+dataX = [vec[0] for vec in pandasDf["pcaFeatures"].apply(lambda x: x.toArray())]
+dataY = [vec[1] for vec in pandasDf["pcaFeatures"].apply(lambda x: x.toArray())]
+
+plt.scatter(dataX, dataY)
+plt.title("PCA Features")
+plt.xlabel("Component 1")
+plt.ylabel("Component 2")
+plt.show()
+
+sns.scatterplot(x=dataX, y=dataY)
+plt.title("PCA Features with Seaborn")
+plt.show()
+# ALS Model Training
+df = df.drop(*[c for c in ['syd', 'did'] if c in df.columns])
+df = df.withColumnRenamed("symptom_index", "syd").withColumnRenamed("diagnose_index", "did")
+df = df.withColumn("wei", F.col("syd") + F.col("did")).na.drop(subset=["syd", "did", "wei"])
+
+# Train-Test Split
+train, test = df.randomSplit([0.75, 0.25], seed=24)
+
+# Drop 'prediction' column if it exists
+if "prediction" in train.columns:
+    train = train.drop("prediction")
+
+# Train ALS model
+rec = ALS(
+    maxIter=10,
+    regParam=0.01,
+    userCol="syd",
+    itemCol="did",
+    ratingCol="wei",
+    nonnegative=True,
+    coldStartStrategy="drop"
+)
+rec_model = rec.fit(train)
+
+# Save ALS model
+rec_model.write().overwrite().save("./models/als_model")
+print("ALS model saved.")
+
+# -----------------------------
+# Flask API with ngrok
+# -----------------------------
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from pyngrok import ngrok
+import os
+
+# Flask App Setup
+app = Flask(__name__)
+CORS(app)
+
+# Spark Session for API
+spark = SparkSession.builder.appName("HealthRecommendationSystemAPI").getOrCreate()
+spark.sparkContext.setLogLevel("ERROR")
+
+# Reload model
+model_path = "./models/als_model"
+rec_saved_model = ALSModel.load(model_path)
+# Cache df snapshot for lookup
+cached_df = df.cache()
+
+# Helper: Get symptom index ID
+def get_id(symptom):
+    try:
+        return int(cached_df.filter(cached_df["symptom"] == symptom).select("syd").first()[0])
+    except Exception as e:
+        raise ValueError(f"Symptom '{symptom}' not found.")
+
+# Helper: Get recommendations
+def get_recommendations(symptom_ids):
+    input_df = cached_df.filter(cached_df["syd"].isin(symptom_ids)).select("syd", "did", "diagnose", "wei")
+    recs = rec_saved_model.transform(input_df).orderBy("prediction", ascending=False)
+    return [{"diagnosis": row.diagnose, "prediction": float(row.prediction)} for row in recs.collect()]
+
+# API Route
+@app.route("/predict", methods=["POST"])
+def predict():
+    try:
+        data = request.get_json()
+        symptoms = [s.strip() for s in data.get("symptoms", "").split(",")]
+        symptom_ids = [get_id(symptom) for symptom in symptoms]
+        recommendations = get_recommendations(symptom_ids)
+        return jsonify({"recommendations": recommendations})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+# Run App with ngrok
+if __name__ == "__main__":
+    public_url = ngrok.connect(5000)
+    print(f"Public URL: {public_url}")
+    app.run(debug=True, use_reloader=False, port=5000)
+
+
